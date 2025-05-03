@@ -1,0 +1,658 @@
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+
+# Set page title and configuration
+st.set_page_config(
+    page_title="Stock Analysis & Trading Simulator",
+    page_icon="📈",
+    layout="wide"
+)
+
+# Set dark theme
+st.markdown("""
+<style>
+    .stApp {
+        background-color: #0e1117;
+        color: #ffffff;
+    }
+    .sidebar .sidebar-content {
+        background-color: #1a1c24;
+    }
+    h1, h2, h3, h4, h5, h6 {
+        color: #ffffff;
+    }
+    .dataframe {
+        color: #ffffff;
+    }
+    .css-145kmo2 {
+        border: 1px solid #2d3035;
+        background-color: #1a1c24;
+    }
+    .stDataFrame {
+        background-color: #1a1c24;
+    }
+    .stTextInput>div>div>input {
+        background-color: #262730;
+        color: white;
+    }
+    .stNumberInput>div>div>input {
+        background-color: #262730;
+        color: white;
+    }
+    .stSelectbox>div>div>select {
+        background-color: #262730;
+        color: white;
+    }
+    .stButton>button {
+        background-color: #4D96FF;
+        color: white;
+    }
+    .stButton>button:hover {
+        background-color: #3D86EF;
+        color: white;
+    }
+    div.block-container {
+        padding-top: 2rem;
+    }
+    div[data-testid="stMetricValue"] {
+        font-size: 24px;
+        color: #ffffff;
+    }
+    div[data-testid="stMetricDelta"] {
+        font-size: 14px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Add additional imports for enhanced functionality
+import time
+import pickle
+import os
+from datetime import datetime, timedelta
+import db
+
+# Setup caching for stock data to avoid rate limits
+DATA_CACHE_DIR = ".data_cache"
+os.makedirs(DATA_CACHE_DIR, exist_ok=True)
+
+# Initialize session state
+if 'initialized' not in st.session_state:
+    # Load portfolio data from database
+    portfolio, cash, transaction_history = db.load_portfolio()
+    
+    st.session_state.portfolio = portfolio if portfolio is not None else {}
+    st.session_state.cash = cash
+    st.session_state.transaction_history = transaction_history
+    st.session_state.last_ticker = 'AAPL'  # Last successfully loaded ticker
+    st.session_state.data_cache = {}  # Cache for stock data
+    st.session_state.initialized = True
+
+# Function to get stock data with caching to avoid rate limits
+def get_stock_data(ticker, start_date, end_date, days=5):
+    """Get stock data with caching to avoid rate limits"""
+    cache_key = f"{ticker}_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}"
+    cache_file = os.path.join(DATA_CACHE_DIR, f"{cache_key}.pkl")
+    
+    # Check if we have cached data that's not too old
+    if os.path.exists(cache_file):
+        file_modified_time = datetime.fromtimestamp(os.path.getmtime(cache_file))
+        if datetime.now() - file_modified_time < timedelta(hours=24):  # Cache valid for 24 hours
+            try:
+                with open(cache_file, 'rb') as f:
+                    return pickle.load(f), None
+            except Exception as e:
+                st.error(f"Error loading cached data: {str(e)}")
+    
+    # No valid cache, fetch from API with retry logic
+    data, error = fetch_with_retry(ticker, start_date, end_date)
+    
+    # If successful, cache the results
+    if data is not None and not data.empty and error is None:
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump(data, f)
+        except Exception as e:
+            st.warning(f"Unable to cache data: {str(e)}")
+    
+    return data, error
+
+# Function to try fetching with retry mechanism and rate limit prevention
+def fetch_with_retry(ticker, start_date, end_date, max_retries=3, delay_seconds=2):
+    """Try to fetch data with retries for rate limit errors"""
+    # Add a mandatory delay before any API call to prevent rate limiting
+    time.sleep(2)
+    
+    for attempt in range(max_retries):
+        try:
+            with st.spinner(f"Fetching data for {ticker}... Attempt {attempt+1}/{max_retries}"):
+                try:
+                    stock_data = yf.download(ticker, start=start_date, end=end_date, progress=False)
+                    if not stock_data.empty:
+                        return stock_data, None
+                except Exception as yf_error:
+                    # Handle Yahoo Finance specific errors
+                    st.warning(f"Data not available right now, try later. (Attempt {attempt+1}/{max_retries})")
+                    if "Rate limit" in str(yf_error):
+                        st.info("Yahoo Finance rate limit reached. Please wait a moment before trying again.")
+                    if attempt == max_retries - 1:
+                        return None, ValueError("Data not available right now, try later.")
+                
+                # Wait between attempts
+                time.sleep(delay_seconds)
+        except Exception as fetch_error:
+            if attempt < max_retries - 1:
+                # Increase delay time for subsequent attempts (exponential backoff)
+                time.sleep(delay_seconds * (attempt + 1))
+            else:
+                return None, ValueError("Data not available right now, try later.")
+    
+    return None, ValueError("Data not available right now, try later.")
+
+# Function to calculate RSI
+def calculate_rsi(data, window=14):
+    # Calculate price changes
+    delta = data.diff()
+    
+    # Get gains and losses
+    gains = delta.copy()
+    losses = delta.copy()
+    gains[gains < 0] = 0
+    losses[losses > 0] = 0
+    losses = abs(losses)
+    
+    # Calculate average gains and losses
+    avg_gain = gains.rolling(window=window).mean()
+    avg_loss = losses.rolling(window=window).mean()
+    
+    # Calculate RS
+    rs = avg_gain / avg_loss
+    
+    # Calculate RSI
+    rsi = 100 - (100 / (1 + rs))
+    
+    return rsi
+
+# Function to get trading recommendation based on RSI
+def get_recommendation(rsi_value):
+    if rsi_value < 30:
+        return "Buy", "green"
+    elif rsi_value > 70:
+        return "Sell", "red"
+    else:
+        return "Hold", "gray"
+
+# Function to execute a trade
+def execute_trade(ticker, action, quantity, current_price):
+    transaction_cost = quantity * current_price
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    if action == "Buy":
+        # Check if user has enough cash
+        if transaction_cost > st.session_state.cash:
+            return False, "Insufficient funds to complete purchase."
+        
+        # Update cash
+        st.session_state.cash -= transaction_cost
+        
+        # Update portfolio
+        if ticker in st.session_state.portfolio:
+            # Calculate new average price
+            current_shares = st.session_state.portfolio[ticker]['shares']
+            current_avg_price = st.session_state.portfolio[ticker]['avg_price']
+            total_shares = current_shares + quantity
+            total_cost = (current_shares * current_avg_price) + transaction_cost
+            new_avg_price = total_cost / total_shares
+            
+            st.session_state.portfolio[ticker]['shares'] = total_shares
+            st.session_state.portfolio[ticker]['avg_price'] = new_avg_price
+        else:
+            st.session_state.portfolio[ticker] = {
+                'shares': quantity,
+                'avg_price': current_price
+            }
+        
+        # Create transaction record
+        transaction = {
+            'timestamp': timestamp,
+            'ticker': ticker,
+            'action': action,
+            'quantity': quantity,
+            'price': current_price,
+            'total': transaction_cost
+        }
+        
+        # Record transaction in session state
+        st.session_state.transaction_history.append(transaction)
+        
+        # Save to database
+        db.save_portfolio(st.session_state.portfolio, st.session_state.cash, transaction)
+        
+        return True, f"Successfully purchased {quantity} shares of {ticker} for ${transaction_cost:.2f}"
+    
+    elif action == "Sell":
+        # Check if user has enough shares
+        if ticker not in st.session_state.portfolio or st.session_state.portfolio[ticker]['shares'] < quantity:
+            return False, "Insufficient shares to complete sale."
+        
+        # Update cash
+        st.session_state.cash += transaction_cost
+        
+        # Update portfolio
+        st.session_state.portfolio[ticker]['shares'] -= quantity
+        
+        # If no shares left, remove from portfolio
+        if st.session_state.portfolio[ticker]['shares'] == 0:
+            del st.session_state.portfolio[ticker]
+        
+        # Create transaction record
+        transaction = {
+            'timestamp': timestamp,
+            'ticker': ticker,
+            'action': action,
+            'quantity': quantity,
+            'price': current_price,
+            'total': transaction_cost
+        }
+        
+        # Record transaction in session state
+        st.session_state.transaction_history.append(transaction)
+        
+        # Save to database
+        db.save_portfolio(st.session_state.portfolio, st.session_state.cash, transaction)
+        
+        return True, f"Successfully sold {quantity} shares of {ticker} for ${transaction_cost:.2f}"
+    
+    return False, "Invalid action specified."
+
+# Function to reset the portfolio
+def reset_portfolio():
+    st.session_state.portfolio = {}
+    st.session_state.cash = 10000.0
+    st.session_state.transaction_history = []
+    
+    # Reset database portfolio
+    db_reset_success = db.reset_db_portfolio()
+    
+    if not db_reset_success:
+        return False, "Failed to reset portfolio in database."
+    
+    return True, "Portfolio has been reset to initial state."
+
+# App title with custom styling
+st.markdown("""
+<div style="background-color: #1E222B; padding: 20px; border-radius: 10px; border-left: 5px solid #4D96FF;">
+    <h1 style="color: #4D96FF; margin: 0;">Stock Analysis & Trading Simulator</h1>
+    <p style="color: #c5c5c5; margin-top: 5px;">Track, analyze, and simulate trades with real-time data</p>
+</div>
+""", unsafe_allow_html=True)
+
+# Create sidebar for inputs
+with st.sidebar:
+    # Styled headers for better appearance
+    st.markdown("""
+    <div style="background-color: #1a1c24; padding: 10px; border-radius: 5px; border-left: 3px solid #4D96FF; margin-bottom: 15px;">
+        <h3 style="color: #4D96FF; margin: 0;">Stock Selection</h3>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    ticker = st.text_input("Enter Stock Ticker Symbol (e.g., AAPL, MSFT)", "AAPL").upper()
+    days = st.number_input("Number of days of data to fetch", min_value=5, max_value=30, value=5)
+    
+    st.markdown("""
+    <div style="background-color: #1a1c24; padding: 10px; border-radius: 5px; border-left: 3px solid #4D96FF; margin-top: 20px; margin-bottom: 15px;">
+        <h3 style="color: #4D96FF; margin: 0;">Portfolio Overview</h3>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Display cash with a more styled appearance
+    st.markdown(f"""
+    <div style="background-color: #262730; padding: 10px; border-radius: 5px; margin-bottom: 10px;">
+        <p style="margin: 0; color: #c5c5c5;">Cash Available</p>
+        <h2 style="color: #4BC0C0; margin: 0;">${st.session_state.cash:.2f}</h2>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    if st.button("Reset Portfolio"):
+        success, message = reset_portfolio()
+        st.success(message) if success else st.error(message)
+
+# Main app area
+try:
+    # Fetch stock data
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days)
+    
+    # Fetch stock data with robust error handling for rate limits
+    # Define sample tickers for fallback suggestions
+    sample_tickers = ['MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA', 'V', 'PYPL', 'HD', 'DIS', 'NFLX']
+    
+    # Create a container for error messages with custom styling
+    error_container = st.empty()
+    
+    # Try to fetch the requested ticker using our caching function
+    data, error = get_stock_data(ticker, start_date, end_date, days)
+    
+    # Handle errors or empty data
+    if error or data is None or data.empty:
+        error_msg = str(error) if error else f"No data found for {ticker}"
+        
+        # Show a nicer error message with fallback options
+        error_container.markdown(f"""
+        <div style="background-color: rgba(255, 0, 0, 0.1); border-left: 5px solid #FF6B6B; padding: 10px; border-radius: 5px; margin-bottom: 20px;">
+            <h3 style="color: #FF6B6B; margin-top: 0;">Data Fetching Error</h3>
+            <p>{error_msg}</p>
+            <p>This may be due to Yahoo Finance rate limits or an invalid ticker symbol.</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Suggest alternative tickers
+        st.markdown("### Try one of these popular tickers instead:")
+        
+        # Create buttons for sample tickers
+        # Create a styled ticker selection grid
+        st.markdown("""
+        <style>
+        .ticker-button {
+            background-color: #1E222B;
+            color: white;
+            border: 1px solid #4D96FF;
+            border-radius: 5px;
+            padding: 8px 12px;
+            text-align: center;
+            text-decoration: none;
+            display: inline-block;
+            font-size: 14px;
+            margin: 4px 2px;
+            cursor: pointer;
+            transition-duration: 0.4s;
+        }
+        .ticker-button:hover {
+            background-color: #4D96FF;
+            color: white;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        cols = st.columns(5)
+        for i, sample_ticker in enumerate(sample_tickers[:5]):
+            if cols[i].button(sample_ticker, key=f"sample_{i}", 
+                             help=f"Load {sample_ticker} stock data"):
+                # Update the ticker in session state
+                st.session_state.last_ticker = sample_ticker
+                st.rerun()
+                
+        cols = st.columns(5)
+        for i, sample_ticker in enumerate(sample_tickers[5:]):
+            if cols[i].button(sample_ticker, key=f"sample_{i+5}", 
+                             help=f"Load {sample_ticker} stock data"):
+                # Update the ticker in session state
+                st.session_state.last_ticker = sample_ticker
+                st.rerun()
+        
+        st.stop()
+    else:
+        # Display company info
+        st.header(f"{ticker} Stock Analysis")
+        
+        # Get stock info
+        stock_info = yf.Ticker(ticker)
+        company_name = stock_info.info.get('longName', ticker)
+        current_price = data['Close'].iloc[-1]
+        
+        st.subheader(f"{company_name} (${ticker})")
+        st.write(f"Current Price: ${current_price:.2f}")
+        
+        # Calculate RSI
+        data['RSI'] = calculate_rsi(data['Close'])
+        latest_rsi = data['RSI'].iloc[-1]
+        recommendation, color = get_recommendation(latest_rsi)
+        
+        # Display metrics
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Latest Close", f"${current_price:.2f}", 
+                      f"{((data['Close'].iloc[-1] - data['Close'].iloc[-2]) / data['Close'].iloc[-2] * 100):.2f}%")
+        
+        with col2:
+            st.metric("RSI (14)", f"{latest_rsi:.2f}")
+        
+        with col3:
+            st.markdown(f"<h3 style='color: {color}'>Recommendation: {recommendation}</h3>", unsafe_allow_html=True)
+        
+        # Create price chart
+        st.subheader("Price Chart")
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=data.index, y=data['Close'], mode='lines', name='Close Price', line=dict(color='#4D96FF', width=2)))
+        
+        # Add volume as a bar chart at the bottom with low opacity
+        fig.add_trace(go.Bar(x=data.index, y=data['Volume'], name='Volume', marker=dict(color='rgba(55, 128, 191, 0.3)'), yaxis='y2'))
+        
+        # Add moving averages
+        data['MA20'] = data['Close'].rolling(window=20).mean()
+        data['MA50'] = data['Close'].rolling(window=50).mean()
+        
+        fig.add_trace(go.Scatter(x=data.index, y=data['MA20'], mode='lines', name='20-day MA', line=dict(color='#FF6B6B', width=1.5, dash='dot')))
+        if len(data) >= 50:  # Only add 50-day MA if we have enough data
+            fig.add_trace(go.Scatter(x=data.index, y=data['MA50'], mode='lines', name='50-day MA', line=dict(color='#FFD166', width=1.5, dash='dot')))
+        
+        # Update layout with dark theme
+        fig.update_layout(
+            title=f"{ticker} Stock Price",
+            xaxis_title="Date",
+            yaxis_title="Price (USD)",
+            yaxis2=dict(
+                title="Volume",
+                overlaying="y",
+                side="right",
+                showgrid=False
+            ),
+            hovermode="x unified",
+            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
+            template="plotly_dark",
+            margin=dict(l=20, r=20, t=40, b=20),
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)'
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Create RSI chart
+        st.subheader("RSI Indicator")
+        
+        fig_rsi = go.Figure()
+        fig_rsi.add_trace(go.Scatter(x=data.index, y=data['RSI'], mode='lines', name='RSI', line=dict(color='#4D96FF', width=2)))
+        
+        # Add threshold lines with more descriptive annotations
+        fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", 
+                        annotation_text="Overbought (70) - Consider Selling", 
+                        annotation_position="right",
+                        annotation_font_color="red",
+                        annotation_font_size=12)
+        
+        fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", 
+                        annotation_text="Oversold (30) - Consider Buying", 
+                        annotation_position="right",
+                        annotation_font_color="green",
+                        annotation_font_size=12)
+        
+        # Add a middle neutral line
+        fig_rsi.add_hline(y=50, line_dash="dot", line_color="gray", 
+                        annotation_text="Neutral (50)", 
+                        annotation_position="right",
+                        annotation_font_color="gray",
+                        annotation_font_size=10)
+        
+        # Color the RSI areas
+        # Green zone for oversold
+        fig_rsi.add_trace(go.Scatter(
+            x=data.index, y=[30] * len(data),
+            fill=None, mode='lines', line_color='rgba(0,0,0,0)',
+            showlegend=False, hoverinfo='none'
+        ))
+        
+        # Red zone for overbought
+        fig_rsi.add_trace(go.Scatter(
+            x=data.index, y=[70] * len(data),
+            fill='tonexty', mode='lines', line_color='rgba(0,0,0,0)',
+            fillcolor='rgba(255,0,0,0.1)', showlegend=False, hoverinfo='none'
+        ))
+        
+        # Update layout with dark theme
+        fig_rsi.update_layout(
+            title="Relative Strength Index (RSI)",
+            xaxis_title="Date",
+            yaxis_title="RSI Value",
+            yaxis=dict(range=[0, 100]),
+            hovermode="x unified",
+            template="plotly_dark",
+            margin=dict(l=20, r=120, t=40, b=20),  # Increased right margin for annotations
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)'
+        )
+        st.plotly_chart(fig_rsi, use_container_width=True)
+        
+        # Trading Simulator Section
+        st.header("Trading Simulator")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Execute Trade")
+            action = st.selectbox("Action", ["Buy", "Sell"])
+            quantity = st.number_input("Quantity", min_value=1, value=10)
+            
+            total_cost = quantity * current_price
+            st.write(f"Total Cost: ${total_cost:.2f}")
+            
+            if st.button("Execute Trade"):
+                success, message = execute_trade(ticker, action, quantity, current_price)
+                if success:
+                    st.success(message)
+                else:
+                    st.error(message)
+        
+        with col2:
+            st.subheader("Current Holdings")
+            
+            if not st.session_state.portfolio:
+                st.write("No stocks currently held.")
+            else:
+                holdings_data = []
+                
+                for stock, details in st.session_state.portfolio.items():
+                    # Fetch current price for the stock using caching
+                    try:
+                        stock_end_date = datetime.now()
+                        stock_start_date = stock_end_date - timedelta(days=1)
+                        current_data, _ = get_stock_data(stock, stock_start_date, stock_end_date)
+                        if current_data is not None and not current_data.empty:
+                            current_stock_price = current_data['Close'].iloc[-1]
+                        else:
+                            st.warning(f"Data not available for {stock} right now, using stored average price.")
+                            current_stock_price = st.session_state.portfolio[stock]['avg_price']
+                    except Exception as e:
+                        st.warning(f"Unable to get current price for {stock}, using stored average price.")
+                        current_stock_price = st.session_state.portfolio[stock]['avg_price']
+                    
+                    # Calculate P&L
+                    shares = details['shares']
+                    avg_price = details['avg_price']
+                    market_value = shares * current_stock_price
+                    cost_basis = shares * avg_price
+                    profit_loss = market_value - cost_basis
+                    profit_loss_percent = (profit_loss / cost_basis) * 100 if cost_basis else 0
+                    
+                    holdings_data.append({
+                        "Ticker": stock,
+                        "Shares": shares,
+                        "Avg. Price": f"${avg_price:.2f}",
+                        "Current Price": f"${current_stock_price:.2f}",
+                        "Market Value": f"${market_value:.2f}",
+                        "P&L": f"${profit_loss:.2f} ({profit_loss_percent:.2f}%)"
+                    })
+                
+                # Display holdings as a styled dataframe
+                holdings_df = pd.DataFrame(holdings_data)
+                
+                # Apply styling to the dataframe with background colors for better visibility
+                def highlight_pnl(val):
+                    """Highlight positive P&L in green and negative in red with background highlight"""
+                    if isinstance(val, str) and '$' in val and '(' in val:
+                        if '-' in val:  # Negative P&L
+                            return 'color: white; background-color: rgba(255,107,107,0.3)'  # Red background
+                        else:  # Positive P&L
+                            return 'color: white; background-color: rgba(75,192,192,0.3)'  # Green background
+                    return ''
+                
+                # Apply row styling based on ticker
+                def highlight_ticker_row(row):
+                    """Add subtle row styling based on ticker for better readability"""
+                    return ['background-color: rgba(77,150,255,0.1)' if row.name % 2 == 0 else 
+                            'background-color: rgba(30,34,43,0.3)'] * len(row)
+                
+                styled_df = holdings_df.style\
+                    .apply(highlight_ticker_row, axis=1)\
+                    .applymap(highlight_pnl, subset=['P&L'])
+                    
+                st.dataframe(styled_df, use_container_width=True)
+        
+        # Display Transaction History
+        st.header("Transaction History")
+        
+        if not st.session_state.transaction_history:
+            st.write("No transactions recorded.")
+        else:
+            # Convert transaction history to DataFrame and display
+            transactions_df = pd.DataFrame(st.session_state.transaction_history)
+            st.dataframe(transactions_df, use_container_width=True)
+        
+        # Total Portfolio Value
+        st.header("Portfolio Summary")
+        
+        total_portfolio_value = st.session_state.cash
+        total_invested = 0
+        
+        for stock, details in st.session_state.portfolio.items():
+            try:
+                stock_end_date = datetime.now()
+                stock_start_date = stock_end_date - timedelta(days=1)
+                current_data, _ = get_stock_data(stock, stock_start_date, stock_end_date)
+                if current_data is not None and not current_data.empty:
+                    current_stock_price = current_data['Close'].iloc[-1]
+                else:
+                    st.warning(f"Data not available for {stock} right now, using stored average price.")
+                    current_stock_price = st.session_state.portfolio[stock]['avg_price']
+            except Exception as e:
+                st.warning(f"Unable to get current price for {stock}, using stored average price.")
+                current_stock_price = st.session_state.portfolio[stock]['avg_price']
+            
+            market_value = details['shares'] * current_stock_price
+            cost_basis = details['shares'] * details['avg_price']
+            
+            total_portfolio_value += market_value
+            total_invested += cost_basis
+        
+        # Calculate overall P&L
+        overall_profit_loss = total_portfolio_value - (10000.0)  # Initial cash was 10000
+        overall_profit_loss_percent = (overall_profit_loss / 10000.0) * 100
+        
+        # Create metrics
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Total Portfolio Value", f"${total_portfolio_value:.2f}")
+        
+        with col2:
+            st.metric("Cash Available", f"${st.session_state.cash:.2f}")
+        
+        with col3:
+            st.metric("Overall P&L", f"${overall_profit_loss:.2f}", f"{overall_profit_loss_percent:.2f}%")
+
+except Exception as e:
+    st.error(f"An error occurred: {str(e)}")
+    st.info("Please check the ticker symbol and try again.")
